@@ -1,0 +1,22 @@
+# @package _global_
+
+##########################################################################################################
+# EXPERIMENT CONFIGURATION FILE                                                                          #
+##########################################################################################################
+
+defaults:
+  - sota-waymo
+  - _self_
+
+name: sota-large-waymo
+model:
+  _backbone:
+    layers: [128, 128, 128, 128, 128]
+    stem_type: META
+
+  _head:
+    fpn:
+      1: 256
+
+    classification_head_channels: 256
+    regression_head_channels: 256
