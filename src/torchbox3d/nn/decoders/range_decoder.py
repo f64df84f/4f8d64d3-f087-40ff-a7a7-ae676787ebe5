@@ -70,15 +70,10 @@ class RangeDecoder:
                 )
 
                 if self.enable_sample_by_range:
-                    scores, categories, cuboids = _slower_sampler(
+                    scores, categories, cuboids = sample_by_range(
                         scores, categories, cuboids, cart
                     )
                 else:
-
-                    # scores, categories, cuboids = _fast_sampler(
-                    #     scores, categories, cuboids, cart
-                    # )
-
                     scores = BCHW_to_BKC(scores).squeeze(-1)
                     cuboids = BCHW_to_BKC(cuboids)
                     categories = (BCHW_to_BKC(categories)).squeeze(-1)
@@ -133,23 +128,33 @@ class RangeDecoder:
         return params, scores, categories, batch_index
 
 
-def _slower_sampler(
-    scores: Tensor, categories: Tensor, cuboids: Tensor, cart: Tensor
+def sample_by_range(
+    scores: Tensor,
+    categories: Tensor,
+    cuboids: Tensor,
+    cart: Tensor,
+    lower_bounds: Tuple[float, ...] = (0.0, 15.0, 30.0),
+    upper_bounds: Tuple[float, ...] = (15.0, 30.0, torch.inf),
+    rates: Tuple[float, ...] = (8.0, 2.0, 1.0).
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    scores_list = []
-    categories_list = []
-    cuboids_list = []
 
+    # Compute distances.
     dists = cart.norm(dim=1, keepdim=True)
-    lower_bounds = torch.as_tensor((0, 15, 30), device=scores.device).view(1, -1, 1, 1)
-    upper_bounds = torch.as_tensor((15, 30, torch.inf), device=scores.device).view(
+    lower_bounds = torch.as_tensor(lower_bounds, device=scores.device).view(1, -1, 1, 1)
+    upper_bounds = torch.as_tensor(upper_bounds, device=scores.device).view(
         1, -1, 1, 1
     )
     partitions = torch.logical_and(dists > lower_bounds, dists <= upper_bounds)
 
-    rates = [4, 2, 1]
+    scores_list = []
+    categories_list = []
+    cuboids_list = []
+    
+    # Iterate over the non-overlapping partitions.
     for i, partition in enumerate(partitions.transpose(1, 0)):
         rate = rates[i]
+
+        # Subsample at each partition by the corresponding rate.
         scores_list.append(
             ((scores * partition.unsqueeze(1))[:, :, ::, ::rate]).flatten(2)
         )
@@ -161,88 +166,3 @@ def _slower_sampler(
     cuboids = torch.cat(cuboids_list, dim=-1)
 
     return scores.squeeze(1), categories.squeeze(1), cuboids.transpose(2, 1)
-
-
-def _fast_sampler(
-    scores: Tensor, categories: Tensor, cuboids: Tensor, cart: Tensor
-) -> Tuple[Tensor, Tensor, Tensor]:
-    B, C, H, W = cuboids.shape
-    dists = cart.norm(dim=1, keepdim=True)
-
-    lower_bounds = torch.as_tensor((0, 10, 15, 20, 30, 45), device=scores.device).view(
-        1, -1, 1, 1
-    )
-    upper_bounds = torch.as_tensor(
-        (15, 20, 30, 40, 60, torch.inf), device=scores.device
-    ).view(1, -1, 1, 1)
-    partitions = torch.logical_and(dists > lower_bounds, dists <= upper_bounds)
-
-    # counts = partitions.sum(dim=[2, 3])
-
-    scores = scores[:, :, None] * partitions[:, None]
-    categories = categories[:, :, None] * partitions[:, None]
-    cuboids = cuboids[:, :, None] * partitions[:, None]
-
-    num_partitions = lower_bounds.shape[1]
-
-    # H * W (number of total sampling indices)
-    all_indices = (
-        torch.arange(0, H * W, device=scores.device)
-        .view(1, -1)
-        .repeat_interleave(num_partitions, 0)
-    )
-
-    # Map H * W -> H * W * factor
-    # 2^5, 2^4, ... 1
-    factors = 2 ** torch.arange(0, num_partitions, device=scores.device).flip(0).view(
-        -1, 1
-    )
-
-    # up = counts.flatten() // factors.flatten()
-
-    # 2^5 * (0, 1, 2, ..., H * W)
-    strided_indices = (factors * all_indices).flatten()
-
-    # Filter out indices that were mapped our of domain.
-    partition_indices = torch.arange(
-        0, num_partitions, device=scores.device
-    ).repeat_interleave(H * W)
-
-    mask = strided_indices < H * W
-    partition_indices = partition_indices[mask]
-    spatial_indices = strided_indices[mask]
-
-    K = spatial_indices.shape[0]
-
-    batch_indices = torch.arange(0, B, device=scores.device)
-    cuboid_indices = torch.arange(0, C, device=scores.device)
-
-    indices = torch.stack(
-        [batch_indices.repeat_interleave(K), partition_indices, spatial_indices], dim=-1
-    )
-    cuboid_indices = torch.stack(
-        [
-            batch_indices.repeat(C * K),
-            cuboid_indices.repeat_interleave(B * K),
-            partition_indices.repeat(C),
-            spatial_indices.repeat(C),
-        ],
-        dim=-1,
-    )
-
-    raveled_indices = ravel_multi_index(indices, shape=[B, num_partitions, H * W])
-    raveled_cuboids_indices = ravel_multi_index(
-        cuboid_indices, shape=[B, C, num_partitions, H * W]
-    )
-
-    scores = scores.flatten().gather(0, raveled_indices).view(B, -1)
-
-    # scores_upper = (scores.flatten() > 0).sum()
-    categories = categories.flatten().gather(0, raveled_indices).view(B, -1)
-    cuboids = (
-        cuboids.flatten()
-        .gather(0, raveled_cuboids_indices)
-        .view(B, C, -1)
-        .permute(0, 2, 1)
-    )
-    return scores, categories, cuboids
